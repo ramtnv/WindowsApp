@@ -21,28 +21,6 @@ user32 = ctypes.windll.user32
 shell32 = ctypes.windll.shell32
 gdi32 = ctypes.windll.gdi32
 
-user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
-user32.GetCursorPos.restype = w.BOOL
-user32.SystemParametersInfoW.argtypes = [w.UINT, w.UINT, ctypes.c_void_p, w.UINT]
-user32.SystemParametersInfoW.restype = w.BOOL
-user32.GetIconInfo.argtypes = [w.HICON, ctypes.POINTER(ctypes.c_void_p)]
-user32.GetIconInfo.restype = w.BOOL
-user32.GetDC.argtypes = [w.HWND]
-user32.GetDC.restype = w.HDC
-user32.ReleaseDC.argtypes = [w.HWND, w.HDC]
-user32.ReleaseDC.restype = w.INT
-user32.DestroyIcon.argtypes = [w.HICON]
-user32.DestroyIcon.restype = w.BOOL
-shell32.SHGetFileInfoW.argtypes = [w.LPCWSTR, w.DWORD, ctypes.POINTER(SHFILEINFO), w.UINT, w.UINT]
-shell32.SHGetFileInfoW.restype = w.DWORD_PTR
-gdi32.GetObjectW.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p]
-gdi32.GetObjectW.restype = ctypes.c_int
-gdi32.GetDIBits.argtypes = [w.HDC, w.HBITMAP, w.UINT, w.UINT, ctypes.c_void_p,
-                            ctypes.POINTER(ctypes.c_void_p), w.UINT]
-gdi32.GetDIBits.restype = ctypes.c_int
-gdi32.DeleteObject.argtypes = [w.HANDLE]
-gdi32.DeleteObject.restype = w.BOOL
-
 SHGFI_ICON = 0x000000100
 SHGFI_LARGEICON = 0x000000000
 SHGFI_USEFILEATTRIBUTES = 0x00000010
@@ -59,6 +37,12 @@ class RECT(ctypes.Structure):
                 ("right", w.LONG), ("bottom", w.LONG)]
 
 
+class ICONINFO(ctypes.Structure):
+    _fields_ = [("fIcon", w.BOOL), ("xHotspot", w.DWORD),
+                ("yHotspot", w.DWORD), ("hbmMask", w.HBITMAP),
+                ("hbmColor", w.HBITMAP)]
+
+
 class SHFILEINFO(ctypes.Structure):
     _fields_ = [
         ("hIcon", w.HANDLE),
@@ -67,6 +51,29 @@ class SHFILEINFO(ctypes.Structure):
         ("szDisplayName", w.WCHAR * 260),
         ("szTypeName", w.WCHAR * 80),
     ]
+
+
+user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+user32.GetCursorPos.restype = w.BOOL
+user32.SystemParametersInfoW.argtypes = [w.UINT, w.UINT, ctypes.c_void_p, w.UINT]
+user32.SystemParametersInfoW.restype = w.BOOL
+user32.GetIconInfo.argtypes = [w.HICON, ctypes.POINTER(ICONINFO)]
+user32.GetIconInfo.restype = w.BOOL
+user32.GetDC.argtypes = [w.HWND]
+user32.GetDC.restype = w.HDC
+user32.ReleaseDC.argtypes = [w.HWND, w.HDC]
+user32.ReleaseDC.restype = w.INT
+user32.DestroyIcon.argtypes = [w.HICON]
+user32.DestroyIcon.restype = w.BOOL
+shell32.SHGetFileInfoW.argtypes = [w.LPCWSTR, w.DWORD, ctypes.POINTER(SHFILEINFO), w.UINT, w.UINT]
+shell32.SHGetFileInfoW.restype = ctypes.c_void_p
+gdi32.GetObjectW.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p]
+gdi32.GetObjectW.restype = ctypes.c_int
+gdi32.GetDIBits.argtypes = [w.HDC, w.HBITMAP, w.UINT, w.UINT, ctypes.c_void_p,
+                            ctypes.c_void_p, w.UINT]
+gdi32.GetDIBits.restype = ctypes.c_int
+gdi32.DeleteObject.argtypes = [w.HANDLE]
+gdi32.DeleteObject.restype = w.BOOL
 
 
 def get_cursor_pos():
@@ -87,11 +94,6 @@ def get_primary_workarea():
 # Icon extraction
 # ---------------------------------------------------------------------------
 def _icon_to_rgb(hicon):
-    class ICONINFO(ctypes.Structure):
-        _fields_ = [("fIcon", w.BOOL), ("xHotspot", w.DWORD),
-                    ("yHotspot", w.DWORD), ("hbmMask", w.HBITMAP),
-                    ("hbmColor", w.HBITMAP)]
-
     ii = ICONINFO()
     if not user32.GetIconInfo(hicon, ctypes.byref(ii)):
         return None
@@ -243,6 +245,8 @@ class LiquidGlassDock:
         self.config = load_config()
         self.shortcuts = list(self.config.get("shortcuts", []))
         self.icon_images = {}
+        self.item_rects = {}
+        self.shortcut_ids = {}
 
         self.root = tk.Tk()
         self.root.overrideredirect(True)
@@ -287,9 +291,6 @@ class LiquidGlassDock:
             y = wa["y"]
         elif pos == "bottom":
             y = wa["y"] + wa["height"] - hgt
-        # Vertically center when dock height is less than full work area
-        if pos in ("left", "right"):
-            y = wa["y"] + (wa["height"] - hgt) // 2
         return x, y, wd, hgt
 
     def hidden_pos(self, wa):
@@ -323,27 +324,16 @@ class LiquidGlassDock:
 
         tint = self.config.get("tintColor", "#1a1a24")
         accent = self.config.get("accentColor", "#00d2ff")
+        radius = int(self.RADIUS * (self.config.get("scale", 100) / 100.0))
 
-        # Glass backdrop panel, full dock height, rounded sides
-        self.canvas.create_rectangle(
-            0, 0, wd, hgt, fill=tint, outline="")
-        # Subtle accent border on the dock edge
-        edge_color = self._lighten(accent, 30)
-        if self.config.get("position") == "right":
-            self.canvas.create_rectangle(0, 0, 2, hgt, fill=accent, outline="")
-        elif self.config.get("position") == "left":
-            self.canvas.create_rectangle(wd - 2, 0, wd, hgt, fill=accent, outline="")
-        elif self.config.get("position") == "top":
-            self.canvas.create_rectangle(0, hgt - 2, wd, hgt, fill=accent, outline="")
-        elif self.config.get("position") == "bottom":
-            self.canvas.create_rectangle(0, 0, wd, 2, fill=accent, outline="")
+        # Glass backdrop panel with rounded corners
+        self._rounded_rect(0, 0, wd, hgt, radius, tint, accent, 1)
 
         item_size = int(self.ITEM_SIZE * (self.config.get("scale", 100) / 100.0))
         gap = int(self.GAP * (self.config.get("scale", 100) / 100.0))
 
-        # Center shortcuts vertically within the dock
-        total_h = len(self.shortcuts) * item_size + max(0, len(self.shortcuts) - 1) * gap
-        cy = (hgt - total_h) // 2 if self.shortcuts else hgt // 2
+        # Shortcuts start near the top of the dock
+        cy = 20 + item_size / 2
 
         for sc in self.shortcuts:
             img = self._load_icon(sc, item_size)
@@ -351,29 +341,61 @@ class LiquidGlassDock:
             self._add_item(cx, cy, item_size, sc, img)
             cy += item_size + gap
 
-        # Right-click anywhere on dock background opens settings
-        self.canvas.tag_bind("all", "<Button-3>", lambda e: self.open_settings())
-        self.canvas.bind("<Button-3>", lambda e: self.open_settings())
+        # Settings gear icon at bottom corner
+        gear_size = item_size
+        gear_x0 = cx - gear_size / 2
+        gear_y0 = hgt - 30 - gear_size
+        gear_x1 = cx + gear_size / 2
+        gear_y1 = hgt - 30
+        gear = self.canvas.create_text(cx, hgt - 30 - gear_size / 2, text="⚙",
+                                       fill=self._lighten(accent, 40),
+                                       font=("Segoe UI", int(20 * self.config.get("scale", 100) / 100.0)))
+        self.canvas.tag_bind(gear, "<Button-1>", lambda e: self.open_settings())
+        self.canvas.tag_bind(gear, "<Enter>",
+                             lambda e: self.canvas.itemconfigure(gear, fill=accent))
+        self.canvas.tag_bind(gear, "<Leave>",
+                             lambda e: self.canvas.itemconfigure(
+                                 gear, fill=self._lighten(accent, 40)))
+
 
     def _add_item(self, cx, cy, size, sc, img):
         x0, y0 = cx - size / 2, cy - size / 2
         x1, y1 = cx + size / 2, cy + size / 2
+        radius = int(self.RADIUS * (self.config.get("scale", 100) / 100.0) * 0.6)
         accent = self.config.get("accentColor", "#00d2ff")
 
-        container = self.canvas.create_rectangle(
-            x0, y0, x1, y1, fill="#242430", outline=accent, width=1)
+        container = self._rounded_rect(x0, y0, x1, y1, radius, "#242430", accent, 1)
         icon_id = self.canvas.create_image(cx, cy, image=img)
 
-        self.canvas.tag_bind(container, "<Button-1>",
+        def _enter(e, items=container):
+            for it in items:
+                try:
+                    self.canvas.itemconfigure(it, fill="#303040", outline=accent, width=2)
+                except Exception:
+                    pass
+
+        def _leave(e, items=container):
+            for it in items:
+                try:
+                    self.canvas.itemconfigure(it, fill="#242430", outline=accent, width=1)
+                except Exception:
+                    pass
+
+        self.canvas.tag_bind(container[0], "<Button-1>",
                              lambda e, s=sc: self.launch_shortcut(s))
         self.canvas.tag_bind(icon_id, "<Button-1>",
                              lambda e, s=sc: self.launch_shortcut(s))
-        self.canvas.tag_bind(container, "<Enter>",
-                             lambda e, c=container: self.canvas.itemconfigure(
-                                 c, fill="#303040", outline=accent, width=2))
-        self.canvas.tag_bind(container, "<Leave>",
-                             lambda e, c=container: self.canvas.itemconfigure(
-                                 c, fill="#242430", outline=accent, width=1))
+        self.canvas.tag_bind(container[0], "<Button-3>",
+                             lambda e, s=sc: self._show_ctx(e, s))
+        self.canvas.tag_bind(icon_id, "<Button-3>",
+                             lambda e, s=sc: self._show_ctx(e, s))
+        self.canvas.tag_bind(container[0], "<Enter>", _enter)
+        self.canvas.tag_bind(container[0], "<Leave>", _leave)
+        self.canvas.tag_bind(icon_id, "<Enter>", _enter)
+        self.canvas.tag_bind(icon_id, "<Leave>", _leave)
+        self.item_rects[container[0]] = sc["id"]
+        self.shortcut_ids[sc["id"]] = container[0]
+        return container[0]
 
     def _load_icon(self, sc, size):
         img = extract_icon(sc.get("targetPath", ""), size=size)
@@ -391,6 +413,56 @@ class LiquidGlassDock:
         g = min(255, g + amount)
         b = min(255, b + amount)
         return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _rounded_rect(self, x0, y0, x1, y1, r, fill, outline="", width=0):
+        """Draw a rounded rectangle on the canvas."""
+        items = []
+        # Clamp radius
+        r = max(0, min(r, (x1 - x0) // 2, (y1 - y0) // 2))
+        if r == 0:
+            items.append(self.canvas.create_rectangle(x0, y0, x1, y1,
+                                                      fill=fill, outline=outline, width=width))
+            return items
+        # Main body (two overlapping rects to fill corners)
+        items.append(self.canvas.create_rectangle(x0 + r, y0, x1 - r, y1,
+                                                  fill=fill, outline=""))
+        items.append(self.canvas.create_rectangle(x0, y0 + r, x1, y1 - r,
+                                                  fill=fill, outline=""))
+        # Four corner arcs
+        items.append(self.canvas.create_arc(x0, y0, x0 + 2 * r, y0 + 2 * r,
+                                            start=90, extent=90, style=tk.PIESLICE,
+                                            fill=fill, outline=""))
+        items.append(self.canvas.create_arc(x1 - 2 * r, y0, x1, y0 + 2 * r,
+                                            start=0, extent=90, style=tk.PIESLICE,
+                                            fill=fill, outline=""))
+        items.append(self.canvas.create_arc(x0, y1 - 2 * r, x0 + 2 * r, y1,
+                                            start=180, extent=90, style=tk.PIESLICE,
+                                            fill=fill, outline=""))
+        items.append(self.canvas.create_arc(x1 - 2 * r, y1 - 2 * r, x1, y1,
+                                            start=270, extent=90, style=tk.PIESLICE,
+                                            fill=fill, outline=""))
+        if outline:
+            items.append(self.canvas.create_arc(x0, y0, x0 + 2 * r, y0 + 2 * r,
+                                                start=90, extent=90, style=tk.ARC,
+                                                outline=outline, width=width))
+            items.append(self.canvas.create_arc(x1 - 2 * r, y0, x1, y0 + 2 * r,
+                                                start=0, extent=90, style=tk.ARC,
+                                                outline=outline, width=width))
+            items.append(self.canvas.create_arc(x0, y1 - 2 * r, x0 + 2 * r, y1,
+                                                start=180, extent=90, style=tk.ARC,
+                                                outline=outline, width=width))
+            items.append(self.canvas.create_arc(x1 - 2 * r, y1 - 2 * r, x1, y1,
+                                                start=270, extent=90, style=tk.ARC,
+                                                outline=outline, width=width))
+            items.append(self.canvas.create_line(x0 + r, y0, x1 - r, y0,
+                                                 fill=outline, width=width))
+            items.append(self.canvas.create_line(x0 + r, y1, x1 - r, y1,
+                                                 fill=outline, width=width))
+            items.append(self.canvas.create_line(x0, y0 + r, x0, y1 - r,
+                                                 fill=outline, width=width))
+            items.append(self.canvas.create_line(x1, y0 + r, x1, y1 - r,
+                                                 fill=outline, width=width))
+        return items
 
     # -- launch -------------------------------------------------------------
     def launch_shortcut(self, sc):
