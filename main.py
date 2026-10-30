@@ -141,7 +141,9 @@ def _icon_to_rgb(hicon):
                         o = (y * row) + (x * 4)
                         b, g, rr = raw[o], raw[o + 1], raw[o + 2]
                         po = (y * width + x) * 3
-                        rgb[po], rgb[po + 1], rgb[po + 2] = rr, g, b
+                        rgb[po] = min(255, rr + 40)
+                        rgb[po + 1] = min(255, g + 40)
+                        rgb[po + 2] = min(255, b + 40)
                 return width, height, bytes(rgb)
             finally:
                 user32.ReleaseDC(None, hdc)
@@ -190,7 +192,6 @@ def placeholder_icon(size=64):
     img.put("#5a5a70", to=(pad, pad, size - 1 - pad, size - 1 - pad))
     return img
 
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -202,6 +203,7 @@ DEFAULT_CONFIG = {
     "position": "right",
     "autoHide": True,
     "proximityThreshold": 25,
+    "autoHideDelay": 0,
     "monitor": "primary",
     "transparency": 0.85,
     "scale": 100,
@@ -210,6 +212,8 @@ DEFAULT_CONFIG = {
     "offsetX": 0,
     "offsetY": 0,
     "showBorders": True,
+    "itemEffect": "none",
+    "backgroundBlur": 0,
     "tintColor": "#1a1a24",
     "accentColor": "#00d2ff",
     "shortcuts": [],
@@ -251,6 +255,10 @@ class LiquidGlassDock:
         self.icon_images = {}
         self.item_rects = {}
         self.shortcut_ids = {}
+        self._item_geom = {}
+        self._zoom_items = {}
+        self._zoom_box = {}
+        self._tooltip_item = None
 
         self.root = tk.Tk()
         self.root.overrideredirect(True)
@@ -266,6 +274,8 @@ class LiquidGlassDock:
         self.settings_win = None
         self.hidden = False
         self.animating = False
+        self.tooltip_win = None
+        self.show_delay_id = None
 
         self._bind_events()
         self._place_window()
@@ -292,8 +302,10 @@ class LiquidGlassDock:
         x, y = wa["x"], wa["y"]
         if pos == "right":
             x = wa["x"] + wa["width"] - wd - indent + off_x
+            y = wa["y"] + off_y
         elif pos == "left":
             x = wa["x"] + indent + off_x
+            y = wa["y"] + off_y
         elif pos == "top":
             y = wa["y"] + indent + off_y
         elif pos == "bottom":
@@ -310,8 +322,10 @@ class LiquidGlassDock:
         x, y = wa["x"], wa["y"]
         if pos == "right":
             x = wa["x"] + wa["width"] + 40 - indent + off_x
+            y = wa["y"] + off_y
         elif pos == "left":
             x = wa["x"] - wd - 40 + indent + off_x
+            y = wa["y"] + off_y
         elif pos == "top":
             y = wa["y"] - hgt - 40 + indent + off_y
         elif pos == "bottom":
@@ -326,49 +340,63 @@ class LiquidGlassDock:
 
     # -- dock building ------------------------------------------------------
     def _build_dock(self):
-        self.canvas.delete("all")
+        if getattr(self, "_rebuilding", False):
+            return
+        self._rebuilding = True
+        try:
+            self._cancel_after()
+            self._hide_tooltip()
+            self.animating = False
+            self._hovering_container = None
+            self._zoom_items = {}
+            self._zoom_box = {}
+            self.canvas.delete("all")
 
-        wa = self.workarea()
-        x, y, wd, hgt = self.visible_pos(wa)
-        cx = wd / 2.0
+            wa = self.workarea()
+            x, y, wd, hgt = self.visible_pos(wa)
+            cx = wd / 2.0
 
-        tint = self.config.get("tintColor", "#1a1a24")
-        accent = self.config.get("accentColor", "#00d2ff")
-        radius = int(self.RADIUS * (self.config.get("scale", 100) / 100.0))
-        show_borders = self.config.get("showBorders", True)
+            tint = self.config.get("tintColor", "#1a1a24")
+            accent = self.config.get("accentColor", "#00d2ff")
+            radius = int(self.RADIUS * (self.config.get("scale", 100) / 100.0))
+            show_borders = self.config.get("showBorders", True)
+            blur = self.config.get("backgroundBlur", 0)
+            if blur and blur > 0:
+                tint = self._blend_color(tint, "#808080", blur / 100.0)
 
-        # Glass backdrop panel with rounded corners
-        outline_w = 1 if show_borders else 0
-        self._rounded_rect(0, 0, wd, hgt, radius, tint, accent, outline_w)
+            # Glass backdrop panel with rounded corners
+            outline_w = 1 if show_borders else 0
+            self._rounded_rect(0, 0, wd, hgt, radius, tint, accent, outline_w)
 
-        item_size = int(self.ITEM_SIZE * (self.config.get("scale", 100) / 100.0))
-        gap = int(self.GAP * (self.config.get("scale", 100) / 100.0))
+            item_size = int(self.ITEM_SIZE * (self.config.get("scale", 100) / 100.0))
+            gap = int(self.GAP * (self.config.get("scale", 100) / 100.0))
 
-        # Shortcuts start near the top of the dock
-        cy = 20 + item_size / 2
+            # Shortcuts start near the top of the dock
+            cy = 20 + item_size / 2
 
-        for sc in self.shortcuts:
-            img = self._load_icon(sc, item_size)
-            self.icon_images[sc["id"]] = img
-            self._add_item(cx, cy, item_size, sc, img)
-            cy += item_size + gap
+            for sc in self.shortcuts:
+                img = self._load_icon(sc, item_size)
+                self.icon_images[sc["id"]] = img
+                self._add_item(cx, cy, item_size, sc, img)
+                cy += item_size + gap
 
-        # Settings gear icon at bottom corner
-        gear_size = item_size
-        gear_x0 = cx - gear_size / 2
-        gear_y0 = hgt - 30 - gear_size
-        gear_x1 = cx + gear_size / 2
-        gear_y1 = hgt - 30
-        gear = self.canvas.create_text(cx, hgt - 30 - gear_size / 2, text="⚙",
-                                       fill=self._lighten(accent, 40),
-                                       font=("Segoe UI", int(20 * self.config.get("scale", 100) / 100.0)))
-        self.canvas.tag_bind(gear, "<Button-1>", lambda e: self.open_settings())
-        self.canvas.tag_bind(gear, "<Enter>",
-                             lambda e: self.canvas.itemconfigure(gear, fill=accent))
-        self.canvas.tag_bind(gear, "<Leave>",
-                             lambda e: self.canvas.itemconfigure(
-                                 gear, fill=self._lighten(accent, 40)))
-
+            # Settings gear icon at bottom corner
+            gear_size = item_size
+            gear_x0 = cx - gear_size / 2
+            gear_y0 = hgt - 30 - gear_size
+            gear_x1 = cx + gear_size / 2
+            gear_y1 = hgt - 30
+            gear_fill = self._contrast_color(tint)
+            gear = self.canvas.create_text(cx, hgt - 30 - gear_size / 2, text="⚙",
+                                           fill=gear_fill,
+                                           font=("Segoe UI", int(20 * self.config.get("scale", 100) / 100.0)))
+            self.canvas.tag_bind(gear, "<Button-1>", lambda e: self.open_settings())
+            self.canvas.tag_bind(gear, "<Enter>",
+                                 lambda e: self.canvas.itemconfigure(gear, fill=accent))
+            self.canvas.tag_bind(gear, "<Leave>",
+                                 lambda e: self.canvas.itemconfigure(gear, fill=gear_fill))
+        finally:
+            self._rebuilding = False
 
     def _add_item(self, cx, cy, size, sc, img):
         x0, y0 = cx - size / 2, cy - size / 2
@@ -376,30 +404,74 @@ class LiquidGlassDock:
         radius = int(self.RADIUS * (self.config.get("scale", 100) / 100.0) * 0.6)
         accent = self.config.get("accentColor", "#00d2ff")
         show_borders = self.config.get("showBorders", True)
+        effect = self.config.get("itemEffect", "none")
 
         outline_w = 1 if show_borders else 0
-        hover_w = 2 if show_borders else 0
+        hover_w = 3 if effect in ("scale", "both") else (2 if show_borders else 0)
+
+        # Zoom layer drawn BEHIND the container. The container (which owns the
+        # <Enter>/<Leave> bindings) stays at a FIXED size so its hit-test
+        # region never changes, preventing enter/leave oscillation.
+        z = 6
+        ccx = (x0 + x1) / 2.0
+        ccy = (y0 + y1) / 2.0
+        hw = (x1 - x0) / 2.0 + z
+        hh = (y1 - y0) / 2.0 + z
+        zoom_box = (ccx - hw, ccy - hh, ccx + hw, ccy + hh)
+        zoom_items = self._rounded_rect(x0, y0, x1, y1, radius, "#242430", "", 0)
+        self._item_geom[zoom_items[0]] = (x0, y0, x1, y1, radius, False)
         container = self._rounded_rect(x0, y0, x1, y1, radius, "#242430", accent, outline_w)
+        self._item_geom[container[0]] = (x0, y0, x1, y1, radius, outline_w != 0)
+        self._zoom_items[container[0]] = zoom_items
+        self._zoom_box[container[0]] = zoom_box
         icon_id = self.canvas.create_image(cx, cy, image=img)
+        name = sc.get("name", "")
 
-        def _enter(e, items=container):
-            for it in items:
+        def _style(enter):
+            fill = "#3a3a4a" if enter else "#242430"
+            width = hover_w if enter else outline_w
+            if effect in ("glow", "both") and enter:
+                fill = self._lighten(accent, 28)
+            if effect in ("scale", "both"):
+                zi = self._zoom_items.get(container[0])
+                if zi:
+                    box = self._zoom_box[container[0]] if enter else (x0, y0, x1, y1)
+                    self._set_container_coords(zi, box)
+            for it in container:
                 try:
-                    self.canvas.itemconfigure(it, fill="#303040", outline=accent, width=hover_w)
+                    self.canvas.itemconfigure(it, fill=fill, outline=accent, width=width)
                 except Exception:
                     pass
 
-        def _leave(e, items=container):
-            for it in items:
-                try:
-                    self.canvas.itemconfigure(it, fill="#242430", outline=accent, width=outline_w)
-                except Exception:
-                    pass
+        def _enter(e):
+            _style(True)
+            if self._tooltip_item is not container[0]:
+                self._show_tooltip(name)
+                self._tooltip_item = container[0]
 
-        self.canvas.tag_bind(container[0], "<Button-1>",
-                             lambda e, s=sc: self.launch_shortcut(s))
-        self.canvas.tag_bind(icon_id, "<Button-1>",
-                             lambda e, s=sc: self.launch_shortcut(s))
+        def _leave(e):
+            _style(False)
+            self._hide_tooltip()
+            self._tooltip_item = None
+
+        def _click(e, s=sc):
+            self._flash_item(container)
+            g = self._item_geom.get(container[0])
+            if g:
+                ox0, oy0, ox1, oy1, _, _ = g
+                ccx = (x0 + x1) / 2.0
+                ccy = (y0 + y1) / 2.0
+                z = 6
+                hw = (x1 - x0) / 2.0 + z
+                hh = (y1 - y0) / 2.0 + z
+                spread = (ccx - hw, ccy - hh, ccx + hw, ccy + hh)
+                self._set_container_coords(container, spread)
+                self.root.after(60, lambda: self._set_container_coords(container, (ox0, oy0, ox1, oy1)))
+            self.root.after(150, lambda: self._refill_item(container))
+            self.root.after(160, lambda s=s: self.launch_shortcut(s))
+
+        self.canvas.tag_bind(container[0], "<Button-1>", _click)
+        self.canvas.tag_bind(icon_id, "<Button-1>", _click)
         self.canvas.tag_bind(container[0], "<Button-3>",
                              lambda e, s=sc: self._show_ctx(e, s))
         self.canvas.tag_bind(icon_id, "<Button-3>",
@@ -411,6 +483,47 @@ class LiquidGlassDock:
         self.item_rects[container[0]] = sc["id"]
         self.shortcut_ids[sc["id"]] = container[0]
         return container[0]
+
+    def _show_tooltip(self, text):
+        if not text:
+            return
+        self._hide_tooltip()
+        self.tooltip_win = tk.Toplevel(self.root)
+        self.tooltip_win.wm_overrideredirect(True)
+        self.tooltip_win.attributes("-topmost", True)
+        try:
+            cx, cy = get_cursor_pos()
+            self.tooltip_win.wm_geometry(f"+{cx + 16}+{cy + 16}")
+        except Exception:
+            self.tooltip_win.wm_geometry("+10+10")
+        lbl = tk.Label(self.tooltip_win, text=text, bg="#ffffe0", fg="#000000",
+                       bd=1, relief="solid", padx=5, pady=2, font=("Segoe UI", 9))
+        lbl.pack()
+
+    def _hide_tooltip(self):
+        if self.tooltip_win is not None:
+            try:
+                self.tooltip_win.destroy()
+            except Exception:
+                pass
+            self.tooltip_win = None
+
+    def _flash_item(self, items):
+        accent = self.config.get("accentColor", "#00d2ff")
+        for it in items:
+            try:
+                self.canvas.itemconfigure(it, fill="#ffffff", outline=accent, width=3)
+            except Exception:
+                pass
+
+    def _refill_item(self, items):
+        accent = self.config.get("accentColor", "#00d2ff")
+        width = 1 if self.config.get("showBorders", True) else 0
+        for it in items:
+            try:
+                self.canvas.itemconfigure(it, fill="#242430", outline=accent, width=width)
+            except Exception:
+                pass
 
     def _load_icon(self, sc, size):
         img = extract_icon(sc.get("targetPath", ""), size=size)
@@ -428,6 +541,52 @@ class LiquidGlassDock:
         g = min(255, g + amount)
         b = min(255, b + amount)
         return f"#{r:02x}{g:02x}{b:02x}"
+
+    @staticmethod
+    def _contrast_color(hex_color):
+        hex_color = hex_color.lstrip("#")
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        return "#000000" if lum > 140 else "#ffffff"
+
+    def _rounded_rect_coords(self, x0, y0, x1, y1, r, has_outline):
+        r = max(0, min(r, (x1 - x0) // 2, (y1 - y0) // 2))
+        if r == 0:
+            return [(x0, y0, x1, y1)]
+        coords = [
+            (x0 + r, y0, x1 - r, y1),
+            (x0, y0 + r, x1, y1 - r),
+            (x0, y0, x0 + 2 * r, y0 + 2 * r),
+            (x1 - 2 * r, y0, x1, y0 + 2 * r),
+            (x0, y1 - 2 * r, x0 + 2 * r, y1),
+            (x1 - 2 * r, y1 - 2 * r, x1, y1),
+        ]
+        if has_outline:
+            coords += [
+                (x0, y0, x0 + 2 * r, y0 + 2 * r),
+                (x1 - 2 * r, y0, x1, y0 + 2 * r),
+                (x0, y1 - 2 * r, x0 + 2 * r, y1),
+                (x1 - 2 * r, y1 - 2 * r, x1, y1),
+                (x0 + r, y0, x1 - r, y0),
+                (x0 + r, y1, x1 - r, y1),
+                (x0, y0 + r, x0, y1 - r),
+                (x1, y0 + r, x1, y1 - r),
+            ]
+        return coords
+
+    def _set_container_coords(self, container, box):
+        key = container[0]
+        g = self._item_geom.get(key)
+        if not g:
+            return
+        x0, y0, x1, y1, r, has_outline = g
+        for it, c in zip(container, self._rounded_rect_coords(*box, r, has_outline)):
+            try:
+                self.canvas.coords(it, *c)
+            except Exception:
+                pass
 
     def _rounded_rect(self, x0, y0, x1, y1, r, fill, outline="", width=0):
         """Draw a rounded rectangle on the canvas."""
@@ -526,9 +685,34 @@ class LiquidGlassDock:
         self.config.update(patch)
         self.config["shortcuts"] = self.shortcuts
         save_config(self.config)
-        self.root.attributes("-alpha", self.config.get("transparency", 0.85))
+        base_alpha = self.config.get("transparency", 0.85)
+        blur = self.config.get("backgroundBlur", 0)
+        effective_alpha = base_alpha - (blur / 100.0 * 0.15)
+        self.root.attributes("-alpha", max(0.3, effective_alpha))
         self._place_window()
         self._build_dock()
+
+    def _cancel_after(self):
+        if getattr(self, "show_delay_id", None) is not None:
+            try:
+                self.root.after_cancel(self.show_delay_id)
+            except Exception:
+                pass
+            self.show_delay_id = None
+
+    def _schedule(self, delay, callback):
+        return self.root.after(delay, callback)
+
+    def _blend_color(self, c1, c2, t):
+        def parse(c):
+            c = c.lstrip("#")
+            return tuple(int(c[i:i+2], 16) for i in (0, 2, 4))
+        r1, g1, b1 = parse(c1)
+        r2, g2, b2 = parse(c2)
+        r = int(r1 * (1 - t) + r2 * t)
+        g = int(g1 * (1 - t) + g2 * t)
+        b = int(b1 * (1 - t) + b2 * t)
+        return "#%02x%02x%02x" % (r, g, b)
 
     # -- auto-hide ----------------------------------------------------------
     def _start_poll(self):
@@ -537,6 +721,9 @@ class LiquidGlassDock:
 
     def _poll(self):
         if not self.config.get("autoHide", True):
+            if self.show_delay_id is not None:
+                self.root.after_cancel(self.show_delay_id)
+                self.show_delay_id = None
             self._set_hidden(False)
             return
         try:
@@ -572,24 +759,40 @@ class LiquidGlassDock:
             except Exception:
                 pass
 
-        self._set_hidden(not near)
+        delay = int(self.config.get("autoHideDelay", 0))
+        if near:
+            if self.hidden and self.show_delay_id is None:
+                if delay > 0:
+                    self.show_delay_id = self.root.after(delay, self._do_show)
+                else:
+                    self._do_show()
+        else:
+            if self.show_delay_id is not None:
+                self.root.after_cancel(self.show_delay_id)
+                self.show_delay_id = None
+            self._set_hidden(True)
+
+    def _do_show(self):
+        self.show_delay_id = None
+        if self.hidden:
+            self._set_hidden(False)
 
     def _set_hidden(self, hide):
-        if hide == self.hidden:
-            return
         self.hidden = hide
         wa = self.workarea()
         if hide:
             self.target_x, self.target_y, _, _ = self.hidden_pos(wa)
         else:
             self.target_x, self.target_y, _, _ = self.visible_pos(wa)
-        if not self.animating:
-            self._animate()
+        self._animate()
 
     def _animate(self):
         if self.animating:
             return
         self.animating = True
+        self._animate_step()
+
+    def _animate_step(self):
         wa = self.workarea()
         _, _, wd, hgt = self.visible_pos(wa)
         try:
@@ -603,7 +806,7 @@ class LiquidGlassDock:
             nx = cx + (tx - cx) // max(1, abs(tx - cx)) * min(step, abs(tx - cx)) if tx != cx else cx
             ny = cy + (ty - cy) // max(1, abs(ty - cy)) * min(step, abs(ty - cy)) if ty != cy else cy
             self.root.geometry(f"{wd}x{hgt}+{nx}+{ny}")
-            self.root.after(16, self._animate)
+            self.root.after(16, self._animate_step)
         else:
             self.root.geometry(f"{wd}x{hgt}+{tx}+{ty}")
             self.animating = False
@@ -664,12 +867,10 @@ class SettingsWindow:
         self._panel_shortcuts()
         self._switch("appearance")
 
-        # Exit button at bottom
-        exit_frame = tk.Frame(self.win, bg="#0f0f11")
-        exit_frame.pack(fill="x", padx=20, pady=(0, 16))
-        tk.Button(exit_frame, text="Exit LiquidGlass Dock", bg="#3a2a2a", fg="#ff6b6b", bd=0,
+        # Exit button at bottom of left pane
+        tk.Button(side, text="Exit LiquidGlass Dock", bg="#3a2a2a", fg="#ff6b6b", bd=0,
                   padx=20, pady=8, font=("Segoe UI", 11, "bold"),
-                  cursor="hand2", command=self.dock.quit).pack()
+                  cursor="hand2", command=self.dock.quit).pack(side="bottom", pady=(10, 18), padx=12)
 
     def _panel(self, key):
         f = tk.Frame(self.main, bg="#0f0f11")
@@ -712,6 +913,9 @@ class SettingsWindow:
         scale_row("UI scale (%)", self.sc_var, 75, 200, 25)
         scale_row("Dock height (%)", self.hp_var, 20, 100, 5)
 
+        self.blur_var = tk.IntVar(value=self.dock.config.get("backgroundBlur", 0))
+        scale_row("Background blur", self.blur_var, 0, 100, 1)
+
         # Color pickers
         def color_row(label, var, initial):
             fr = tk.Frame(f, bg="#0f0f11")
@@ -745,7 +949,22 @@ class SettingsWindow:
                        activebackground="#0f0f11", activeforeground="#00d2ff",
                        bd=0, highlightthickness=0, font=("Segoe UI", 10)).pack(side="left")
 
-        tk.Button(f, text="Apply", bg=self.acc_var.get(), fg="#000000", bd=0,
+        # Item effect
+        self.effect_var = tk.StringVar(value=self.dock.config.get("itemEffect", "none"))
+        eff_frame = tk.Frame(f, bg="#0f0f11")
+        eff_frame.pack(fill="x", padx=20, pady=8)
+        tk.Label(eff_frame, text="Item effect", bg="#0f0f11", fg="#d4d4d4",
+                 font=("Segoe UI", 10)).pack(side="left")
+        eg = tk.Frame(eff_frame, bg="#0f0f11")
+        eg.pack(side="right")
+        for text, val in [("None", "none"), ("Glow", "glow"), ("Scale", "scale"), ("Both", "both")]:
+            rb = tk.Radiobutton(eg, text=text, variable=self.effect_var, value=val,
+                                bg="#0f0f11", fg="#d4d4d4", selectcolor="#222228",
+                                activebackground="#0f0f11", activeforeground="#00d2ff",
+                                bd=0, font=("Segoe UI", 10))
+            rb.pack(side="left", padx=4)
+
+        tk.Button(f, text="Apply", bg="white", fg="#000000", bd=0,
                   padx=18, pady=7, font=("Segoe UI", 10, "bold"),
                   cursor="hand2", command=self._apply_appearance).pack(pady=(18, 0))
 
@@ -761,6 +980,7 @@ class SettingsWindow:
         self.indent_var = tk.IntVar(value=self.dock.config.get("indent", 0))
         self.offx_var = tk.IntVar(value=self.dock.config.get("offsetX", 0))
         self.offy_var = tk.IntVar(value=self.dock.config.get("offsetY", 0))
+        self.delay_var = tk.IntVar(value=self.dock.config.get("autoHideDelay", 0))
 
         def radio_row(label, var, options):
             fr = tk.Frame(f, bg="#0f0f11")
@@ -805,8 +1025,9 @@ class SettingsWindow:
         scale_row("Indent from edge (px)", self.indent_var, 0, 100, 1)
         scale_row("X offset (px)", self.offx_var, -200, 200, 1)
         scale_row("Y offset (px)", self.offy_var, -200, 200, 1)
+        scale_row("Auto-hide delay (ms)", self.delay_var, 0, 1000, 1)
 
-        tk.Button(f, text="Apply", bg=self.dock.config.get("accentColor", "#00d2ff"),
+        tk.Button(f, text="Apply", bg="white",
                   fg="#000000", bd=0, padx=18, pady=7, font=("Segoe UI", 10, "bold"),
                   cursor="hand2", command=self._apply_positioning).pack(pady=(20, 0))
 
@@ -840,7 +1061,7 @@ class SettingsWindow:
         tk.Label(f, text="Right-click the dock to open settings. Click a shortcut to launch.",
                  bg="#0f0f11", fg="#888", font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(6, 0))
 
-        tk.Button(f, text="Apply", bg=self.dock.config.get("accentColor", "#00d2ff"),
+        tk.Button(f, text="Apply", bg="white",
                   fg="#000000", bd=0, padx=18, pady=7, font=("Segoe UI", 10, "bold"),
                   cursor="hand2", command=self._apply_shortcuts).pack(pady=(14, 0))
 
@@ -861,6 +1082,7 @@ class SettingsWindow:
         self.indent_var.set(self.dock.config.get("indent", 0))
         self.offx_var.set(self.dock.config.get("offsetX", 0))
         self.offy_var.set(self.dock.config.get("offsetY", 0))
+        self.delay_var.set(self.dock.config.get("autoHideDelay", 0))
 
     def _apply_appearance(self):
         patch = {
@@ -870,6 +1092,8 @@ class SettingsWindow:
             "tintColor": self.tint_var.get(),
             "accentColor": self.acc_var.get(),
             "showBorders": bool(self.borders_var.get()),
+            "itemEffect": self.effect_var.get(),
+            "backgroundBlur": int(self.blur_var.get()),
         }
         self.dock.update_config(patch)
 
@@ -878,6 +1102,7 @@ class SettingsWindow:
             "position": self.pos_var.get(),
             "autoHide": self.ah_var.get() == "true",
             "proximityThreshold": int(self.prox_var.get()),
+            "autoHideDelay": int(self.delay_var.get()),
             "monitor": self.mon_var.get(),
             "indent": int(self.indent_var.get()),
             "offsetX": int(self.offx_var.get()),
