@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""Liquid Glass Dock - macOS-inspired liquid-glass dock for Windows.
+
+Built with Python tkinter + ctypes (Win32 API). Provides:
+  * Vertical liquid-glass dock (50% height, vertically centered)
+  * Auto-hide based on mouse proximity to screen edge
+  * Dynamic shortcuts with original application icon extraction (SHGetFileInfo)
+  * Settings window with color options, opened via dock right-click
+"""
+import ctypes
+import ctypes.wintypes as w
+import json
+import os
+import tkinter as tk
+from tkinter import colorchooser, filedialog, messagebox
+
+# ---------------------------------------------------------------------------
+# Win32 API bindings (ctypes, stdlib only)
+# ---------------------------------------------------------------------------
+user32 = ctypes.windll.user32
+shell32 = ctypes.windll.shell32
+gdi32 = ctypes.windll.gdi32
+
+SHGFI_ICON = 0x000000100
+SHGFI_LARGEICON = 0x000000000
+SHGFI_USEFILEATTRIBUTES = 0x00000010
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+SPI_GETWORKAREA = 0x0030
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", w.LONG), ("y", w.LONG)]
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", w.LONG), ("top", w.LONG),
+                ("right", w.LONG), ("bottom", w.LONG)]
+
+
+class SHFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ("hIcon", w.HANDLE),
+        ("iIcon", w.INT),
+        ("dwAttributes", w.DWORD),
+        ("szDisplayName", w.WCHAR * 260),
+        ("szTypeName", w.WCHAR * 80),
+    ]
+
+
+def get_cursor_pos():
+    pt = POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+def get_primary_workarea():
+    rect = RECT()
+    user32.SystemParametersInfoW(SPI_GETWORKAREA, ctypes.sizeof(rect),
+                                 ctypes.byref(rect), 0)
+    return {"x": rect.left, "y": rect.top,
+            "width": rect.right - rect.left, "height": rect.bottom - rect.top}
+
+
+# ---------------------------------------------------------------------------
+# Icon extraction
+# ---------------------------------------------------------------------------
+def _icon_to_rgb(hicon):
+    class ICONINFO(ctypes.Structure):
+        _fields_ = [("fIcon", w.BOOL), ("xHotspot", w.DWORD),
+                    ("yHotspot", w.DWORD), ("hbmMask", w.HBITMAP),
+                    ("hbmColor", w.HBITMAP)]
+
+    ii = ICONINFO()
+    if not user32.GetIconInfo(hicon, ctypes.byref(ii)):
+        return None
+    try:
+        if not ii.hbmColor:
+            return None
+        try:
+            class BITMAP(ctypes.Structure):
+                _fields_ = [("bmType", w.LONG), ("bmWidth", w.LONG),
+                            ("bmHeight", w.LONG), ("bmWidthBytes", w.LONG),
+                            ("bmPlanes", w.WORD), ("bmBitsPixel", w.WORD),
+                            ("bmBits", w.LPVOID)]
+            bm = BITMAP()
+            if gdi32.GetObjectW(ii.hbmColor, ctypes.sizeof(bm),
+                                ctypes.byref(bm)) == 0:
+                return None
+            width, height = bm.bmWidth, bm.bmHeight
+            hdc = user32.GetDC(None)
+            try:
+                class BIH(ctypes.Structure):
+                    _fields_ = [("biSize", w.DWORD), ("biWidth", w.LONG),
+                                ("biHeight", w.LONG), ("biPlanes", w.WORD),
+                                ("biBitCount", w.WORD), ("biCompression", w.DWORD),
+                                ("biSizeImage", w.DWORD), ("biXPelsPerMeter", w.LONG),
+                                ("biYPelsPerMeter", w.LONG), ("biClrUsed", w.DWORD),
+                                ("biClrImportant", w.DWORD)]
+                class BI(ctypes.Structure):
+                    _fields_ = [("bmiHeader", BIH), ("bmiColors", w.DWORD * 3)]
+                bmi = BI()
+                bmi.bmiHeader.biSize = ctypes.sizeof(BIH)
+                bmi.bmiHeader.biWidth = width
+                bmi.bmiHeader.biHeight = -height
+                bmi.bmiHeader.biPlanes = 1
+                bmi.bmiHeader.biBitCount = 32
+                bmi.bmiHeader.biCompression = 0
+                row = ((width * 32 + 31) // 32) * 4
+                buf = ctypes.create_string_buffer(row * height)
+                if gdi32.GetDIBits(hdc, ii.hbmColor, 0, height, buf,
+                                   ctypes.byref(bmi), 0) == 0:
+                    return None
+                raw = buf.raw
+                rgb = bytearray(width * height * 3)
+                for y in range(height):
+                    for x in range(width):
+                        o = (y * row) + (x * 4)
+                        b, g, rr = raw[o], raw[o + 1], raw[o + 2]
+                        po = (y * width + x) * 3
+                        rgb[po], rgb[po + 1], rgb[po + 2] = rr, g, b
+                return width, height, bytes(rgb)
+            finally:
+                user32.ReleaseDC(None, hdc)
+        finally:
+            for handle in (ii.hbmColor, ii.hbmMask):
+                try:
+                    if handle:
+                        gdi32.DeleteObject(w.HANDLE(handle))
+                except Exception:
+                    pass
+    finally:
+        user32.DestroyIcon(hicon)
+    return None
+
+
+def extract_icon(target_path, size=64):
+    if not target_path or not os.path.exists(target_path):
+        return None
+    sfi = SHFILEINFO()
+    res = shell32.SHGetFileInfoW(
+        target_path, FILE_ATTRIBUTE_NORMAL,
+        ctypes.byref(sfi), ctypes.sizeof(sfi),
+        SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
+    )
+    if not res or not sfi.hIcon:
+        return None
+    try:
+        result = _icon_to_rgb(sfi.hIcon)
+    finally:
+        user32.DestroyIcon(sfi.hIcon)
+    if result is None:
+        return None
+    width, height, rgb = result
+    try:
+        ppm = (b"P6\n%d %d\n255\n" % (width, height)) + rgb
+        img = tk.PhotoImage(width=width, height=height, data=ppm)
+        return img
+    except Exception:
+        return None
+
+
+def placeholder_icon(size=64):
+    img = tk.PhotoImage(width=size, height=size)
+    img.put("#3a3a4a", to=(0, 0, size - 1, size - 1))
+    pad = max(2, size // 8)
+    img.put("#5a5a70", to=(pad, pad, size - 1 - pad, size - 1 - pad))
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                          "LiquidGlassDock")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+DEFAULT_CONFIG = {
+    "position": "right",
+    "autoHide": True,
+    "proximityThreshold": 25,
+    "monitor": "primary",
+    "transparency": 0.85,
+    "scale": 100,
+    "dockHeightPct": 50,
+    "tintColor": "#1a1a24",
+    "accentColor": "#00d2ff",
+    "shortcuts": [],
+}
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        merged = dict(DEFAULT_CONFIG)
+        merged.update(cfg)
+        return merged
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print("Failed to save config:", e)
+
+
+# ---------------------------------------------------------------------------
+# Dock application
+# ---------------------------------------------------------------------------
+class LiquidGlassDock:
+    ITEM_SIZE = 60
+    GAP = 18
+    RADIUS = 16
+    WIDTH = 100
+
+    def __init__(self):
+        self.config = load_config()
+        self.shortcuts = list(self.config.get("shortcuts", []))
+        self.icon_images = {}
+
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", self.config.get("transparency", 0.85))
+        self.root.config(bg="#000000")
+        self.root.resizable(False, False)
+
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0,
+                                bg="#000000")
+        self.canvas.pack(fill="both", expand=True)
+
+        self.settings_win = None
+        self.hidden = False
+        self.animating = False
+
+        self._bind_events()
+        self._place_window()
+        self._build_dock()
+        self._start_poll()
+
+    # -- geometry -----------------------------------------------------------
+    def workarea(self):
+        return get_primary_workarea()
+
+    def dock_width(self):
+        return int(self.WIDTH * (self.config.get("scale", 100) / 100.0))
+
+    def dock_height(self, wa):
+        return int(wa["height"] * (self.config.get("dockHeightPct", 50) / 100.0))
+
+    def visible_pos(self, wa):
+        wd = self.dock_width()
+        hgt = self.dock_height(wa)
+        pos = self.config.get("position", "right")
+        x, y = wa["x"], wa["y"]
+        if pos == "right":
+            x = wa["x"] + wa["width"] - wd
+        elif pos == "left":
+            x = wa["x"]
+        elif pos == "top":
+            y = wa["y"]
+        elif pos == "bottom":
+            y = wa["y"] + wa["height"] - hgt
+        # Vertically center when dock height is less than full work area
+        if pos in ("left", "right"):
+            y = wa["y"] + (wa["height"] - hgt) // 2
+        return x, y, wd, hgt
+
+    def hidden_pos(self, wa):
+        wd = self.dock_width()
+        hgt = self.dock_height(wa)
+        pos = self.config.get("position", "right")
+        x, y = wa["x"], wa["y"]
+        if pos == "right":
+            x = wa["x"] + wa["width"] + 40
+        elif pos == "left":
+            x = wa["x"] - wd - 40
+        elif pos == "top":
+            y = wa["y"] - hgt - 40
+        elif pos == "bottom":
+            y = wa["y"] + wa["height"] + 40
+        return x, y, wd, hgt
+
+    def _place_window(self):
+        wa = self.workarea()
+        x, y, wd, hgt = self.visible_pos(wa)
+        self.root.geometry(f"{wd}x{hgt}+{x}+{y}")
+        self.canvas.config(width=wd, height=hgt)
+
+    # -- dock building ------------------------------------------------------
+    def _build_dock(self):
+        self.canvas.delete("all")
+
+        wa = self.workarea()
+        x, y, wd, hgt = self.visible_pos(wa)
+        cx = wd / 2.0
+
+        tint = self.config.get("tintColor", "#1a1a24")
+        accent = self.config.get("accentColor", "#00d2ff")
+
+        # Glass backdrop panel, full dock height, rounded sides
+        self.canvas.create_rectangle(
+            0, 0, wd, hgt, fill=tint, outline="")
+        # Subtle accent border on the dock edge
+        edge_color = self._lighten(accent, 30)
+        if self.config.get("position") == "right":
+            self.canvas.create_rectangle(0, 0, 2, hgt, fill=accent, outline="")
+        elif self.config.get("position") == "left":
+            self.canvas.create_rectangle(wd - 2, 0, wd, hgt, fill=accent, outline="")
+        elif self.config.get("position") == "top":
+            self.canvas.create_rectangle(0, hgt - 2, wd, hgt, fill=accent, outline="")
+        elif self.config.get("position") == "bottom":
+            self.canvas.create_rectangle(0, 0, wd, 2, fill=accent, outline="")
+
+        item_size = int(self.ITEM_SIZE * (self.config.get("scale", 100) / 100.0))
+        gap = int(self.GAP * (self.config.get("scale", 100) / 100.0))
+
+        # Center shortcuts vertically within the dock
+        total_h = len(self.shortcuts) * item_size + max(0, len(self.shortcuts) - 1) * gap
+        cy = (hgt - total_h) // 2 if self.shortcuts else hgt // 2
+
+        for sc in self.shortcuts:
+            img = self._load_icon(sc, item_size)
+            self.icon_images[sc["id"]] = img
+            self._add_item(cx, cy, item_size, sc, img)
+            cy += item_size + gap
+
+        # Right-click anywhere on dock background opens settings
+        self.canvas.tag_bind("all", "<Button-3>", lambda e: self.open_settings())
+        self.canvas.bind("<Button-3>", lambda e: self.open_settings())
+
+    def _add_item(self, cx, cy, size, sc, img):
+        x0, y0 = cx - size / 2, cy - size / 2
+        x1, y1 = cx + size / 2, cy + size / 2
+        accent = self.config.get("accentColor", "#00d2ff")
+
+        container = self.canvas.create_rectangle(
+            x0, y0, x1, y1, fill="#242430", outline=accent, width=1)
+        icon_id = self.canvas.create_image(cx, cy, image=img)
+
+        self.canvas.tag_bind(container, "<Button-1>",
+                             lambda e, s=sc: self.launch_shortcut(s))
+        self.canvas.tag_bind(icon_id, "<Button-1>",
+                             lambda e, s=sc: self.launch_shortcut(s))
+        self.canvas.tag_bind(container, "<Enter>",
+                             lambda e, c=container: self.canvas.itemconfigure(
+                                 c, fill="#303040", outline=accent, width=2))
+        self.canvas.tag_bind(container, "<Leave>",
+                             lambda e, c=container: self.canvas.itemconfigure(
+                                 c, fill="#242430", outline=accent, width=1))
+
+    def _load_icon(self, sc, size):
+        img = extract_icon(sc.get("targetPath", ""), size=size)
+        if img is None:
+            img = placeholder_icon(size)
+        return img
+
+    @staticmethod
+    def _lighten(hex_color, amount):
+        hex_color = hex_color.lstrip("#")
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        r = min(255, r + amount)
+        g = min(255, g + amount)
+        b = min(255, b + amount)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    # -- launch -------------------------------------------------------------
+    def launch_shortcut(self, sc):
+        path = sc.get("targetPath", "")
+        if not path:
+            return
+        try:
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror("Launch failed", str(e))
+
+    # -- settings -----------------------------------------------------------
+    def open_settings(self):
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.lift()
+            return
+        SettingsWindow(self)
+
+    def add_shortcut(self, target_path):
+        if not target_path:
+            return
+        for sc in self.shortcuts:
+            if sc["targetPath"] == target_path:
+                return
+        import uuid
+        sc = {
+            "id": str(uuid.uuid4()),
+            "name": os.path.basename(target_path),
+            "targetPath": target_path,
+        }
+        self.shortcuts.append(sc)
+        self.config["shortcuts"] = self.shortcuts
+        save_config(self.config)
+        self._place_window()
+        self._build_dock()
+
+    def remove_shortcut(self, sid):
+        self.shortcuts = [s for s in self.shortcuts if s["id"] != sid]
+        self.config["shortcuts"] = self.shortcuts
+        save_config(self.config)
+        self.icon_images.pop(sid, None)
+        self._place_window()
+        self._build_dock()
+
+    def update_config(self, patch):
+        self.config.update(patch)
+        self.config["shortcuts"] = self.shortcuts
+        save_config(self.config)
+        self.root.attributes("-alpha", self.config.get("transparency", 0.85))
+        self._place_window()
+        self._build_dock()
+
+    # -- auto-hide ----------------------------------------------------------
+    def _start_poll(self):
+        self._poll()
+        self.root.after(40, self._start_poll)
+
+    def _poll(self):
+        if not self.config.get("autoHide", True):
+            self._set_hidden(False)
+            return
+        try:
+            cx, cy = get_cursor_pos()
+        except Exception:
+            return
+        wa = self.workarea()
+        x, y, wd, hgt = self.visible_pos(wa)
+        thresh = self.config.get("proximityThreshold", 25)
+        pos = self.config.get("position", "right")
+
+        near = False
+        if pos == "right":
+            edge = wa["x"] + wa["width"]
+            near = edge - thresh <= cx <= edge
+        elif pos == "left":
+            near = wa["x"] <= cx <= wa["x"] + thresh
+        elif pos == "top":
+            near = wa["y"] <= cy <= wa["y"] + thresh
+        elif pos == "bottom":
+            edge = wa["y"] + wa["height"]
+            near = edge - thresh <= cy <= edge
+
+        # Hysteresis: keep visible while cursor over dock
+        if not self.hidden:
+            try:
+                rx = self.root.winfo_rootx()
+                ry = self.root.winfo_rooty()
+                rw = self.root.winfo_width()
+                rh = self.root.winfo_height()
+                if rx <= cx < rx + rw and ry <= cy < ry + rh:
+                    near = True
+            except Exception:
+                pass
+
+        self._set_hidden(not near)
+
+    def _set_hidden(self, hide):
+        if hide == self.hidden:
+            return
+        self.hidden = hide
+        wa = self.workarea()
+        if hide:
+            _, _, _, _ = self.hidden_pos(wa)
+            self.target_x, self.target_y, _, _ = self.hidden_pos(wa)
+        else:
+            self.target_x, self.target_y, _, _ = self.visible_pos(wa)
+        self._animate()
+
+    def _animate(self):
+        if self.animating:
+            return
+        self.animating = True
+        wa = self.workarea()
+        _, _, wd, hgt = self.visible_pos(wa)
+        try:
+            cx = self.root.winfo_rootx()
+            cy = self.root.winfo_rooty()
+        except Exception:
+            cx, cy = self.target_x, self.target_y
+        step = 24
+        if self.hidden:
+            tx, ty = self.target_x, self.target_y
+            if abs(cx - tx) > 1 or abs(cy - ty) > 1:
+                nx = cx + (tx - cx) // max(1, abs(tx - cx)) * min(step, abs(tx - cx)) if tx != cx else cx
+                ny = cy + (ty - cy) // max(1, abs(ty - cy)) * min(step, abs(ty - cy)) if ty != cy else cy
+                self.root.geometry(f"{wd}x{hgt}+{nx}+{ny}")
+                self.root.after(16, self._animate)
+            else:
+                self.root.geometry(f"{wd}x{hgt}+{tx}+{ty}")
+                self.animating = False
+        else:
+            tx, ty = self.target_x, self.target_y
+            if abs(cx - tx) > 1 or abs(cy - ty) > 1:
+                nx = cx + (tx - cx) // max(1, abs(tx - cx)) * min(step, abs(tx - cx)) if tx != cx else cx
+                ny = cy + (ty - cy) // max(1, abs(ty - cy)) * min(step, abs(ty - cy)) if ty != cy else cy
+                self.root.geometry(f"{wd}x{hgt}+{nx}+{ny}")
+                self.root.after(16, self._animate)
+            else:
+                self.root.geometry(f"{wd}x{hgt}+{tx}+{ty}")
+                self.animating = False
+
+    def _bind_events(self):
+        self.root.bind("<Escape>", lambda e: self.quit())
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)
+
+    def quit(self):
+        save_config(self.config)
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.destroy()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+# ---------------------------------------------------------------------------
+# Settings window
+# ---------------------------------------------------------------------------
+class SettingsWindow:
+    def __init__(self, dock):
+        self.dock = dock
+        self.win = tk.Toplevel(dock.root)
+        self.win.title("Liquid Glass Dock - Settings")
+        self.win.geometry("700x560")
+        self.win.attributes("-topmost", True)
+        self.win.resizable(False, False)
+        self.win.config(bg="#0f0f11")
+
+        self._build_ui()
+        self._load_values()
+
+    def _build_ui(self):
+        side = tk.Frame(self.win, bg="#1a1a1e", width=170)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        tk.Label(side, text="LiquidGlass", bg="#1a1a1e", fg="#fff",
+                 font=("Segoe UI", 12, "bold")).pack(pady=(18, 10), padx=12)
+
+        self.tabs = {}
+        for label, key in [("Appearance", "appearance"),
+                           ("Positioning", "positioning"),
+                           ("Shortcuts", "shortcuts")]:
+            b = tk.Button(side, text=label, bg="#1a1a1e", fg="#b0b0b8",
+                          bd=0, activebackground="#24242a", activeforeground="#00d2ff",
+                          anchor="w", padx=12, pady=8, cursor="hand2",
+                          command=lambda k=key: self._switch(k))
+            b.pack(fill="x")
+            self.tabs[key] = b
+        self.tabs["appearance"].config(fg="#00d2ff")
+
+        self.main = tk.Frame(self.win, bg="#0f0f11")
+        self.main.pack(side="right", fill="both", expand=True)
+        self.panels = {}
+        self._panel_appearance()
+        self._panel_positioning()
+        self._panel_shortcuts()
+        self._switch("appearance")
+
+    def _panel(self, key):
+        f = tk.Frame(self.main, bg="#0f0f11")
+        f.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.panels[key] = f
+        return f
+
+    def _switch(self, key):
+        for k, b in self.tabs.items():
+            b.config(fg="#00d2ff" if k == key else "#b0b0b8",
+                     bg="#24242a" if k == key else "#1a1a1e")
+        for k, f in self.panels.items():
+            if k == key:
+                f.place(relx=0, rely=0, relwidth=1, relheight=1)
+            else:
+                f.place_forget()
+
+    def _panel_appearance(self):
+        f = self._panel("appearance")
+        tk.Label(f, text="Appearance", bg="#0f0f11", fg="#fff",
+                 font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=20, pady=(20, 10))
+
+        def scale_row(label, var, frm, to, res):
+            fr = tk.Frame(f, bg="#0f0f11")
+            fr.pack(fill="x", padx=20, pady=6)
+            tk.Label(fr, text=label, bg="#0f0f11", fg="#d4d4d4",
+                     font=("Segoe UI", 10)).pack(side="left")
+            sp = tk.Scale(fr, from_=frm, to=to, resolution=res, orient="horizontal",
+                          variable=var, bg="#0f0f11", fg="#fff",
+                          troughcolor="#222228", activebackground="#00d2ff",
+                          highlightthickness=0, bd=0, showvalue=False,
+                          command=lambda v: var.set(float(v)))
+            sp.pack(side="right", fill="x", expand=True, padx=(10, 0))
+            return sp
+
+        self.tr_var = tk.DoubleVar(value=self.dock.config.get("transparency", 0.85))
+        self.sc_var = tk.DoubleVar(value=self.dock.config.get("scale", 100))
+        self.hp_var = tk.IntVar(value=self.dock.config.get("dockHeightPct", 50))
+        scale_row("Transparency", self.tr_var, 0.4, 1, 0.05)
+        scale_row("UI scale (%)", self.sc_var, 75, 200, 25)
+        scale_row("Dock height (%)", self.hp_var, 20, 100, 5)
+
+        # Color pickers
+        def color_row(label, var, initial):
+            fr = tk.Frame(f, bg="#0f0f11")
+            fr.pack(fill="x", padx=20, pady=8)
+            tk.Label(fr, text=label, bg="#0f0f11", fg="#d4d4d4",
+                     font=("Segoe UI", 10)).pack(side="left")
+            swatch = tk.Label(fr, bg=initial, width=3, height=1,
+                              relief="solid", bd=1, cursor="hand2")
+            swatch.pack(side="right", padx=(10, 0))
+
+            def pick():
+                c = colorchooser.askcolor(color=initial, title=label)
+                if c and c[1]:
+                    var.set(c[1])
+                    swatch.config(bg=c[1])
+
+            swatch.bind("<Button-1>", lambda e: pick())
+            return swatch
+
+        self.tint_var = tk.StringVar(value=self.dock.config.get("tintColor", "#1a1a24"))
+        self.acc_var = tk.StringVar(value=self.dock.config.get("accentColor", "#00d2ff"))
+        color_row("Dock tint", self.tint_var, self.tint_var.get())
+        color_row("Accent color", self.acc_var, self.acc_var.get())
+
+        tk.Button(f, text="Apply", bg=self.acc_var.get(), fg="#000000", bd=0,
+                  padx=18, pady=7, font=("Segoe UI", 10, "bold"),
+                  cursor="hand2", command=self._apply_appearance).pack(pady=(18, 0))
+
+    def _panel_positioning(self):
+        f = self._panel("positioning")
+        tk.Label(f, text="Positioning", bg="#0f0f11", fg="#fff",
+                 font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=20, pady=(20, 10))
+
+        self.pos_var = tk.StringVar(value=self.dock.config.get("position", "right"))
+        self.ah_var = tk.StringVar(value="true" if self.dock.config.get("autoHide", True) else "false")
+        self.mon_var = tk.StringVar(value=self.dock.config.get("monitor", "primary"))
+        self.prox_var = tk.IntVar(value=self.dock.config.get("proximityThreshold", 25))
+
+        def radio_row(label, var, options):
+            fr = tk.Frame(f, bg="#0f0f11")
+            fr.pack(fill="x", padx=20, pady=6)
+            tk.Label(fr, text=label, bg="#0f0f11", fg="#d4d4d4",
+                     font=("Segoe UI", 10)).pack(side="left")
+            grp = tk.Frame(fr, bg="#0f0f11")
+            grp.pack(side="right")
+            for text, val in options:
+                rb = tk.Radiobutton(grp, text=text, variable=var, value=val,
+                                    bg="#0f0f11", fg="#d4d4d4", selectcolor="#222228",
+                                    activebackground="#0f0f11", activeforeground="#00d2ff",
+                                    bd=0, font=("Segoe UI", 10))
+                rb.pack(side="left", padx=4)
+            return grp
+
+        radio_row("Dock edge", self.pos_var,
+                  [("Right", "right"), ("Left", "left"), ("Top", "top"), ("Bottom", "bottom")])
+        radio_row("Auto-hide", self.ah_var, [("On", "true"), ("Off", "false")])
+        radio_row("Monitor", self.mon_var, [("Primary", "primary"), ("Cursor screen", "cursor")])
+
+        fr = tk.Frame(f, bg="#0f0f11")
+        fr.pack(fill="x", padx=20, pady=6)
+        tk.Label(fr, text="Proximity threshold (px)", bg="#0f0f11", fg="#d4d4d4",
+                 font=("Segoe UI", 10)).pack(side="left")
+        tk.Spinbox(fr, from_=5, to=100, textvariable=self.prox_var, width=6,
+                   bg="#1a1a1e", fg="#fff", bd=0).pack(side="right")
+
+        tk.Button(f, text="Apply", bg=self.dock.config.get("accentColor", "#00d2ff"),
+                  fg="#000000", bd=0, padx=18, pady=7, font=("Segoe UI", 10, "bold"),
+                  cursor="hand2", command=self._apply_positioning).pack(pady=(20, 0))
+
+    def _panel_shortcuts(self):
+        f = self._panel("shortcuts")
+        tk.Label(f, text="Shortcuts", bg="#0f0f11", fg="#fff",
+                 font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=20, pady=(20, 10))
+
+        list_frame = tk.Frame(f, bg="#16161a", bd=1, relief="solid")
+        list_frame.pack(fill="both", expand=True, padx=20, pady=8)
+
+        self.sc_listbox = tk.Listbox(list_frame, bg="#16161a", fg="#eee",
+                                     selectbackground=self.dock.config.get("accentColor", "#00d2ff"),
+                                     selectforeground="#000000", bd=0,
+                                     highlightthickness=0, font=("Segoe UI", 10),
+                                     activestyle="none")
+        self.sc_listbox.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(list_frame, command=self.sc_listbox.yview)
+        scroll.pack(side="right", fill="y")
+        self.sc_listbox.config(yscrollcommand=scroll.set)
+
+        btn_frame = tk.Frame(f, bg="#0f0f11")
+        btn_frame.pack(fill="x", padx=20, pady=4)
+        tk.Button(btn_frame, text="Add shortcut", bg="#242430", fg="#fff", bd=0,
+                  padx=12, pady=5, cursor="hand2",
+                  command=self._add_shortcut_dialog).pack(side="left")
+        tk.Button(btn_frame, text="Remove selected", bg="#3a2a2a", fg="#ff6b6b", bd=0,
+                  padx=12, pady=5, cursor="hand2",
+                  command=self._remove_selected).pack(side="left", padx=(8, 0))
+
+        tk.Label(f, text="Right-click the dock to open settings. Click a shortcut to launch.",
+                 bg="#0f0f11", fg="#888", font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(6, 0))
+
+        tk.Button(f, text="Apply", bg=self.dock.config.get("accentColor", "#00d2ff"),
+                  fg="#000000", bd=0, padx=18, pady=7, font=("Segoe UI", 10, "bold"),
+                  cursor="hand2", command=self._apply_shortcuts).pack(pady=(14, 0))
+
+        self._refresh_list()
+
+    def _refresh_list(self):
+        self.sc_listbox.delete(0, tk.END)
+        acc = self.dock.config.get("accentColor", "#00d2ff")
+        self.sc_listbox.config(selectbackground=acc, selectforeground="#000000")
+        for sc in self.dock.shortcuts:
+            self.sc_listbox.insert(tk.END, f"{sc['name']}   |   {sc['targetPath']}")
+
+    def _load_values(self):
+        self.pos_var.set(self.dock.config.get("position", "right"))
+        self.ah_var.set("true" if self.dock.config.get("autoHide", True) else "false")
+        self.mon_var.set(self.dock.config.get("monitor", "primary"))
+        self.prox_var.set(self.dock.config.get("proximityThreshold", 25))
+
+    def _apply_appearance(self):
+        patch = {
+            "transparency": float(self.tr_var.get()),
+            "scale": int(self.sc_var.get()),
+            "dockHeightPct": int(self.hp_var.get()),
+            "tintColor": self.tint_var.get(),
+            "accentColor": self.acc_var.get(),
+        }
+        self.dock.update_config(patch)
+
+    def _apply_positioning(self):
+        patch = {
+            "position": self.pos_var.get(),
+            "autoHide": self.ah_var.get() == "true",
+            "proximityThreshold": int(self.prox_var.get()),
+            "monitor": self.mon_var.get(),
+        }
+        self.dock.update_config(patch)
+
+    def _apply_shortcuts(self):
+        self.dock._build_dock()
+        self.win.destroy()
+        self.dock.settings_win = None
+
+    def _add_shortcut_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Select application",
+            filetypes=[("Executables / shortcuts", "*.exe *.lnk"), ("All files", "*.*")])
+        if path:
+            self.dock.add_shortcut(path)
+            self._refresh_list()
+
+    def _remove_selected(self):
+        sel = self.sc_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        sc = self.dock.shortcuts[idx]
+        self.dock.remove_shortcut(sc["id"])
+        self._refresh_list()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main():
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+    app = LiquidGlassDock()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
