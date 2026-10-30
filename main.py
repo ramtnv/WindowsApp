@@ -21,6 +21,28 @@ user32 = ctypes.windll.user32
 shell32 = ctypes.windll.shell32
 gdi32 = ctypes.windll.gdi32
 
+user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+user32.GetCursorPos.restype = w.BOOL
+user32.SystemParametersInfoW.argtypes = [w.UINT, w.UINT, ctypes.c_void_p, w.UINT]
+user32.SystemParametersInfoW.restype = w.BOOL
+user32.GetIconInfo.argtypes = [w.HICON, ctypes.POINTER(ctypes.c_void_p)]
+user32.GetIconInfo.restype = w.BOOL
+user32.GetDC.argtypes = [w.HWND]
+user32.GetDC.restype = w.HDC
+user32.ReleaseDC.argtypes = [w.HWND, w.HDC]
+user32.ReleaseDC.restype = w.INT
+user32.DestroyIcon.argtypes = [w.HICON]
+user32.DestroyIcon.restype = w.BOOL
+shell32.SHGetFileInfoW.argtypes = [w.LPCWSTR, w.DWORD, ctypes.POINTER(SHFILEINFO), w.UINT, w.UINT]
+shell32.SHGetFileInfoW.restype = w.DWORD_PTR
+gdi32.GetObjectW.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p]
+gdi32.GetObjectW.restype = ctypes.c_int
+gdi32.GetDIBits.argtypes = [w.HDC, w.HBITMAP, w.UINT, w.UINT, ctypes.c_void_p,
+                            ctypes.POINTER(ctypes.c_void_p), w.UINT]
+gdi32.GetDIBits.restype = ctypes.c_int
+gdi32.DeleteObject.argtypes = [w.HANDLE]
+gdi32.DeleteObject.restype = w.BOOL
+
 SHGFI_ICON = 0x000000100
 SHGFI_LARGEICON = 0x000000000
 SHGFI_USEFILEATTRIBUTES = 0x00000010
