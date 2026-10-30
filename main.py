@@ -206,6 +206,10 @@ DEFAULT_CONFIG = {
     "transparency": 0.85,
     "scale": 100,
     "dockHeightPct": 50,
+    "indent": 0,
+    "offsetX": 0,
+    "offsetY": 0,
+    "showBorders": True,
     "tintColor": "#1a1a24",
     "accentColor": "#00d2ff",
     "shortcuts": [],
@@ -282,30 +286,36 @@ class LiquidGlassDock:
         wd = self.dock_width()
         hgt = self.dock_height(wa)
         pos = self.config.get("position", "right")
+        indent = int(self.config.get("indent", 0))
+        off_x = int(self.config.get("offsetX", 0))
+        off_y = int(self.config.get("offsetY", 0))
         x, y = wa["x"], wa["y"]
         if pos == "right":
-            x = wa["x"] + wa["width"] - wd
+            x = wa["x"] + wa["width"] - wd - indent + off_x
         elif pos == "left":
-            x = wa["x"]
+            x = wa["x"] + indent + off_x
         elif pos == "top":
-            y = wa["y"]
+            y = wa["y"] + indent + off_y
         elif pos == "bottom":
-            y = wa["y"] + wa["height"] - hgt
+            y = wa["y"] + wa["height"] - hgt - indent + off_y
         return x, y, wd, hgt
 
     def hidden_pos(self, wa):
         wd = self.dock_width()
         hgt = self.dock_height(wa)
         pos = self.config.get("position", "right")
+        indent = int(self.config.get("indent", 0))
+        off_x = int(self.config.get("offsetX", 0))
+        off_y = int(self.config.get("offsetY", 0))
         x, y = wa["x"], wa["y"]
         if pos == "right":
-            x = wa["x"] + wa["width"] + 40
+            x = wa["x"] + wa["width"] + 40 - indent + off_x
         elif pos == "left":
-            x = wa["x"] - wd - 40
+            x = wa["x"] - wd - 40 + indent + off_x
         elif pos == "top":
-            y = wa["y"] - hgt - 40
+            y = wa["y"] - hgt - 40 + indent + off_y
         elif pos == "bottom":
-            y = wa["y"] + wa["height"] + 40
+            y = wa["y"] + wa["height"] + 40 - indent + off_y
         return x, y, wd, hgt
 
     def _place_window(self):
@@ -325,9 +335,11 @@ class LiquidGlassDock:
         tint = self.config.get("tintColor", "#1a1a24")
         accent = self.config.get("accentColor", "#00d2ff")
         radius = int(self.RADIUS * (self.config.get("scale", 100) / 100.0))
+        show_borders = self.config.get("showBorders", True)
 
         # Glass backdrop panel with rounded corners
-        self._rounded_rect(0, 0, wd, hgt, radius, tint, accent, 1)
+        outline_w = 1 if show_borders else 0
+        self._rounded_rect(0, 0, wd, hgt, radius, tint, accent, outline_w)
 
         item_size = int(self.ITEM_SIZE * (self.config.get("scale", 100) / 100.0))
         gap = int(self.GAP * (self.config.get("scale", 100) / 100.0))
@@ -363,21 +375,24 @@ class LiquidGlassDock:
         x1, y1 = cx + size / 2, cy + size / 2
         radius = int(self.RADIUS * (self.config.get("scale", 100) / 100.0) * 0.6)
         accent = self.config.get("accentColor", "#00d2ff")
+        show_borders = self.config.get("showBorders", True)
 
-        container = self._rounded_rect(x0, y0, x1, y1, radius, "#242430", accent, 1)
+        outline_w = 1 if show_borders else 0
+        hover_w = 2 if show_borders else 0
+        container = self._rounded_rect(x0, y0, x1, y1, radius, "#242430", accent, outline_w)
         icon_id = self.canvas.create_image(cx, cy, image=img)
 
         def _enter(e, items=container):
             for it in items:
                 try:
-                    self.canvas.itemconfigure(it, fill="#303040", outline=accent, width=2)
+                    self.canvas.itemconfigure(it, fill="#303040", outline=accent, width=hover_w)
                 except Exception:
                     pass
 
         def _leave(e, items=container):
             for it in items:
                 try:
-                    self.canvas.itemconfigure(it, fill="#242430", outline=accent, width=1)
+                    self.canvas.itemconfigure(it, fill="#242430", outline=accent, width=outline_w)
                 except Exception:
                     pass
 
@@ -565,11 +580,11 @@ class LiquidGlassDock:
         self.hidden = hide
         wa = self.workarea()
         if hide:
-            _, _, _, _ = self.hidden_pos(wa)
             self.target_x, self.target_y, _, _ = self.hidden_pos(wa)
         else:
             self.target_x, self.target_y, _, _ = self.visible_pos(wa)
-        self._animate()
+        if not self.animating:
+            self._animate()
 
     def _animate(self):
         if self.animating:
@@ -583,29 +598,17 @@ class LiquidGlassDock:
         except Exception:
             cx, cy = self.target_x, self.target_y
         step = 24
-        if self.hidden:
-            tx, ty = self.target_x, self.target_y
-            if abs(cx - tx) > 1 or abs(cy - ty) > 1:
-                nx = cx + (tx - cx) // max(1, abs(tx - cx)) * min(step, abs(tx - cx)) if tx != cx else cx
-                ny = cy + (ty - cy) // max(1, abs(ty - cy)) * min(step, abs(ty - cy)) if ty != cy else cy
-                self.root.geometry(f"{wd}x{hgt}+{nx}+{ny}")
-                self.root.after(16, self._animate)
-            else:
-                self.root.geometry(f"{wd}x{hgt}+{tx}+{ty}")
-                self.animating = False
+        tx, ty = self.target_x, self.target_y
+        if abs(cx - tx) > 1 or abs(cy - ty) > 1:
+            nx = cx + (tx - cx) // max(1, abs(tx - cx)) * min(step, abs(tx - cx)) if tx != cx else cx
+            ny = cy + (ty - cy) // max(1, abs(ty - cy)) * min(step, abs(ty - cy)) if ty != cy else cy
+            self.root.geometry(f"{wd}x{hgt}+{nx}+{ny}")
+            self.root.after(16, self._animate)
         else:
-            tx, ty = self.target_x, self.target_y
-            if abs(cx - tx) > 1 or abs(cy - ty) > 1:
-                nx = cx + (tx - cx) // max(1, abs(tx - cx)) * min(step, abs(tx - cx)) if tx != cx else cx
-                ny = cy + (ty - cy) // max(1, abs(ty - cy)) * min(step, abs(ty - cy)) if ty != cy else cy
-                self.root.geometry(f"{wd}x{hgt}+{nx}+{ny}")
-                self.root.after(16, self._animate)
-            else:
-                self.root.geometry(f"{wd}x{hgt}+{tx}+{ty}")
-                self.animating = False
+            self.root.geometry(f"{wd}x{hgt}+{tx}+{ty}")
+            self.animating = False
 
     def _bind_events(self):
-        self.root.bind("<Escape>", lambda e: self.quit())
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
     def quit(self):
@@ -660,6 +663,13 @@ class SettingsWindow:
         self._panel_positioning()
         self._panel_shortcuts()
         self._switch("appearance")
+
+        # Exit button at bottom
+        exit_frame = tk.Frame(self.win, bg="#0f0f11")
+        exit_frame.pack(fill="x", padx=20, pady=(0, 16))
+        tk.Button(exit_frame, text="Exit LiquidGlass Dock", bg="#3a2a2a", fg="#ff6b6b", bd=0,
+                  padx=20, pady=8, font=("Segoe UI", 11, "bold"),
+                  cursor="hand2", command=self.dock.quit).pack()
 
     def _panel(self, key):
         f = tk.Frame(self.main, bg="#0f0f11")
@@ -726,6 +736,15 @@ class SettingsWindow:
         color_row("Dock tint", self.tint_var, self.tint_var.get())
         color_row("Accent color", self.acc_var, self.acc_var.get())
 
+        # Border toggle
+        self.borders_var = tk.BooleanVar(value=self.dock.config.get("showBorders", True))
+        borders_frame = tk.Frame(f, bg="#0f0f11")
+        borders_frame.pack(fill="x", padx=20, pady=8)
+        tk.Checkbutton(borders_frame, text="Show dock borders", variable=self.borders_var,
+                       bg="#0f0f11", fg="#d4d4d4", selectcolor="#1a1a1e",
+                       activebackground="#0f0f11", activeforeground="#00d2ff",
+                       bd=0, highlightthickness=0, font=("Segoe UI", 10)).pack(side="left")
+
         tk.Button(f, text="Apply", bg=self.acc_var.get(), fg="#000000", bd=0,
                   padx=18, pady=7, font=("Segoe UI", 10, "bold"),
                   cursor="hand2", command=self._apply_appearance).pack(pady=(18, 0))
@@ -739,6 +758,9 @@ class SettingsWindow:
         self.ah_var = tk.StringVar(value="true" if self.dock.config.get("autoHide", True) else "false")
         self.mon_var = tk.StringVar(value=self.dock.config.get("monitor", "primary"))
         self.prox_var = tk.IntVar(value=self.dock.config.get("proximityThreshold", 25))
+        self.indent_var = tk.IntVar(value=self.dock.config.get("indent", 0))
+        self.offx_var = tk.IntVar(value=self.dock.config.get("offsetX", 0))
+        self.offy_var = tk.IntVar(value=self.dock.config.get("offsetY", 0))
 
         def radio_row(label, var, options):
             fr = tk.Frame(f, bg="#0f0f11")
@@ -766,6 +788,23 @@ class SettingsWindow:
                  font=("Segoe UI", 10)).pack(side="left")
         tk.Spinbox(fr, from_=5, to=100, textvariable=self.prox_var, width=6,
                    bg="#1a1a1e", fg="#fff", bd=0).pack(side="right")
+
+        def scale_row(label, var, frm, to, res):
+            fr2 = tk.Frame(f, bg="#0f0f11")
+            fr2.pack(fill="x", padx=20, pady=6)
+            tk.Label(fr2, text=label, bg="#0f0f11", fg="#d4d4d4",
+                     font=("Segoe UI", 10)).pack(side="left")
+            sp = tk.Scale(fr2, from_=frm, to=to, resolution=res, orient="horizontal",
+                          variable=var, bg="#0f0f11", fg="#fff",
+                          troughcolor="#222228", activebackground="#00d2ff",
+                          highlightthickness=0, bd=0, showvalue=False,
+                          command=lambda v: var.set(int(float(v))))
+            sp.pack(side="right", fill="x", expand=True, padx=(10, 0))
+            return sp
+
+        scale_row("Indent from edge (px)", self.indent_var, 0, 100, 1)
+        scale_row("X offset (px)", self.offx_var, -200, 200, 1)
+        scale_row("Y offset (px)", self.offy_var, -200, 200, 1)
 
         tk.Button(f, text="Apply", bg=self.dock.config.get("accentColor", "#00d2ff"),
                   fg="#000000", bd=0, padx=18, pady=7, font=("Segoe UI", 10, "bold"),
@@ -819,6 +858,9 @@ class SettingsWindow:
         self.ah_var.set("true" if self.dock.config.get("autoHide", True) else "false")
         self.mon_var.set(self.dock.config.get("monitor", "primary"))
         self.prox_var.set(self.dock.config.get("proximityThreshold", 25))
+        self.indent_var.set(self.dock.config.get("indent", 0))
+        self.offx_var.set(self.dock.config.get("offsetX", 0))
+        self.offy_var.set(self.dock.config.get("offsetY", 0))
 
     def _apply_appearance(self):
         patch = {
@@ -827,6 +869,7 @@ class SettingsWindow:
             "dockHeightPct": int(self.hp_var.get()),
             "tintColor": self.tint_var.get(),
             "accentColor": self.acc_var.get(),
+            "showBorders": bool(self.borders_var.get()),
         }
         self.dock.update_config(patch)
 
@@ -836,6 +879,9 @@ class SettingsWindow:
             "autoHide": self.ah_var.get() == "true",
             "proximityThreshold": int(self.prox_var.get()),
             "monitor": self.mon_var.get(),
+            "indent": int(self.indent_var.get()),
+            "offsetX": int(self.offx_var.get()),
+            "offsetY": int(self.offy_var.get()),
         }
         self.dock.update_config(patch)
 
